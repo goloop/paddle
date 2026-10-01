@@ -111,6 +111,9 @@ func (c *Client) CreateTransaction(ctx context.Context, req *CreateTransactionRe
 		case it.Price != nil && it.Price.ProductID == "":
 			return nil, fmt.Errorf("%w: item %d: a non-catalog price needs a product id", ErrInvalid, i)
 		}
+		if it.Quantity < 0 {
+			return nil, fmt.Errorf("%w: item %d has a negative quantity", ErrInvalid, i)
+		}
 		if it.Quantity == 0 {
 			it.Quantity = 1
 		}
@@ -118,6 +121,9 @@ func (c *Client) CreateTransaction(ctx context.Context, req *CreateTransactionRe
 	}
 	var out Transaction
 	if err := c.do(ctx, http.MethodPost, "/transactions", &body, &out); err != nil {
+		return nil, err
+	}
+	if err := expectID("transaction", out.ID, ""); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -130,6 +136,9 @@ func (c *Client) GetTransaction(ctx context.Context, id string) (*Transaction, e
 	}
 	var out Transaction
 	if err := c.do(ctx, http.MethodGet, "/transactions/"+id, nil, &out); err != nil {
+		return nil, err
+	}
+	if err := expectID("transaction", out.ID, id); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -148,6 +157,9 @@ func (c *Client) GetSubscription(ctx context.Context, id string) (*Subscription,
 	}
 	var out Subscription
 	if err := c.do(ctx, http.MethodGet, "/subscriptions/"+id, nil, &out); err != nil {
+		return nil, err
+	}
+	if err := expectID("subscription", out.ID, id); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -170,6 +182,9 @@ func (c *Client) CancelSubscription(ctx context.Context, id, effectiveFrom strin
 	body := map[string]string{"effective_from": effectiveFrom}
 	var out Subscription
 	if err := c.do(ctx, http.MethodPost, "/subscriptions/"+id+"/cancel", body, &out); err != nil {
+		return nil, err
+	}
+	if err := expectID("subscription", out.ID, id); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -199,6 +214,9 @@ func (c *Client) PauseSubscription(ctx context.Context, id string, req *PauseReq
 	}
 	var out Subscription
 	if err := c.do(ctx, http.MethodPost, "/subscriptions/"+id+"/pause", req, &out); err != nil {
+		return nil, err
+	}
+	if err := expectID("subscription", out.ID, id); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -231,6 +249,9 @@ func (c *Client) ResumeSubscription(ctx context.Context, id string, req *ResumeR
 	if err := c.do(ctx, http.MethodPost, "/subscriptions/"+id+"/resume", body, &out); err != nil {
 		return nil, err
 	}
+	if err := expectID("subscription", out.ID, id); err != nil {
+		return nil, err
+	}
 	return &out, nil
 }
 
@@ -244,6 +265,9 @@ func (c *Client) RemoveScheduledChange(ctx context.Context, id string) (*Subscri
 	body := map[string]any{"scheduled_change": nil}
 	var out Subscription
 	if err := c.do(ctx, http.MethodPatch, "/subscriptions/"+id, body, &out); err != nil {
+		return nil, err
+	}
+	if err := expectID("subscription", out.ID, id); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -289,6 +313,9 @@ func (c *Client) ChangeSubscriptionItems(ctx context.Context, id string, items [
 		if it.PriceID == "" {
 			return nil, fmt.Errorf("%w: item %d needs a price id", ErrInvalid, i)
 		}
+		if it.Quantity < 0 {
+			return nil, fmt.Errorf("%w: item %d has a negative quantity", ErrInvalid, i)
+		}
 		if it.Quantity == 0 {
 			it.Quantity = 1
 		}
@@ -297,6 +324,9 @@ func (c *Client) ChangeSubscriptionItems(ctx context.Context, id string, items [
 	body := map[string]any{"items": list, "proration_billing_mode": prorationMode}
 	var out Subscription
 	if err := c.do(ctx, http.MethodPatch, "/subscriptions/"+id, body, &out); err != nil {
+		return nil, err
+	}
+	if err := expectID("subscription", out.ID, id); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -337,6 +367,9 @@ func (c *Client) CreateAdjustment(ctx context.Context, req *CreateAdjustmentRequ
 	if err := c.do(ctx, http.MethodPost, "/adjustments", req, &out); err != nil {
 		return nil, err
 	}
+	if err := expectID("adjustment", out.ID, ""); err != nil {
+		return nil, err
+	}
 	return &out, nil
 }
 
@@ -369,6 +402,9 @@ func (c *Client) CreateCustomer(ctx context.Context, req *CreateCustomerRequest)
 	if err := c.do(ctx, http.MethodPost, "/customers", req, &out); err != nil {
 		return nil, err
 	}
+	if err := expectID("customer", out.ID, ""); err != nil {
+		return nil, err
+	}
 	return &out, nil
 }
 
@@ -379,6 +415,9 @@ func (c *Client) GetCustomer(ctx context.Context, id string) (*Customer, error) 
 	}
 	var out Customer
 	if err := c.do(ctx, http.MethodGet, "/customers/"+id, nil, &out); err != nil {
+		return nil, err
+	}
+	if err := expectID("customer", out.ID, id); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -434,6 +473,9 @@ func (c *Client) EnsureCustomer(ctx context.Context, email, name string) (*Custo
 	if err := c.do(ctx, http.MethodPatch, "/customers/"+cu.ID, body, &out); err != nil {
 		return nil, err
 	}
+	if err := expectID("customer", out.ID, cu.ID); err != nil {
+		return nil, err
+	}
 	return &out, nil
 }
 
@@ -449,6 +491,9 @@ func (c *Client) CreatePortalSession(ctx context.Context, customerID string, sub
 	}
 	var out PortalSession
 	if err := c.do(ctx, http.MethodPost, "/customers/"+customerID+"/portal-sessions", body, &out); err != nil {
+		return nil, err
+	}
+	if err := expectID("portal session", out.ID, ""); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -524,7 +569,7 @@ func (c *Client) ListTransactions(ctx context.Context, req *ListTransactionsRequ
 	if req.PerPage > 0 {
 		q.Set("per_page", strconv.Itoa(req.PerPage))
 	}
-	return list[Transaction](ctx, c, "/transactions", q)
+	return list(ctx, c, "/transactions", q, req.After, func(t Transaction) string { return t.ID })
 }
 
 // ListAdjustmentsRequest filters ListAdjustments. Every field is optional.
@@ -579,12 +624,17 @@ func (c *Client) ListAdjustments(ctx context.Context, req *ListAdjustmentsReques
 	if req.PerPage > 0 {
 		q.Set("per_page", strconv.Itoa(req.PerPage))
 	}
-	return list[Adjustment](ctx, c, "/adjustments", q)
+	return list(ctx, c, "/adjustments", q, req.After, func(a Adjustment) string { return a.ID })
 }
 
 // list fetches one page of a list endpoint. Where the next page starts is
 // read from meta.pagination.next, a URL with an after parameter.
-func list[T any](ctx context.Context, c *Client, path string, q url.Values) (*Page[T], error) {
+//
+// A page that cannot be trusted is an error, not a short list: an item
+// without an id, a promise of more pages with no usable place to continue,
+// or a next page that starts where this one did. A reconciliation job that
+// took any of these for the end would stop early and never know.
+func list[T any](ctx context.Context, c *Client, path string, q url.Values, prev string, id func(T) string) (*Page[T], error) {
 	if len(q) > 0 {
 		path += "?" + q.Encode()
 	}
@@ -593,17 +643,31 @@ func list[T any](ctx context.Context, c *Client, path string, q url.Values) (*Pa
 	if err := c.do(ctx, http.MethodGet, path, nil, lr); err != nil {
 		return nil, err
 	}
+	for i, it := range items {
+		if id(it) == "" {
+			return nil, fmt.Errorf("%w: item %d of the list has no id", ErrResponse, i)
+		}
+	}
 	p := &Page[T]{Items: items}
 	if lr.page.Next != "" {
 		if u, err := url.Parse(lr.page.Next); err == nil {
 			p.After = u.Query().Get("after")
 		}
 	}
-	if lr.page.HasMore != nil {
-		p.HasMore = *lr.page.HasMore && p.After != ""
-	} else {
+	switch {
+	case lr.page.HasMore != nil && *lr.page.HasMore:
+		if p.After == "" {
+			return nil, fmt.Errorf("%w: has_more without a next page (next %q)", ErrResponse, lr.page.Next)
+		}
+		p.HasMore = true
+	case lr.page.HasMore != nil:
+		p.HasMore = false
+	default:
 		// Without has_more, a full page that names a next one may have it.
 		p.HasMore = p.After != "" && len(items) > 0 && len(items) >= max(lr.page.PerPage, 1)
+	}
+	if p.HasMore && p.After == prev {
+		return nil, fmt.Errorf("%w: the next page starts where this one did (after %q)", ErrResponse, prev)
 	}
 	if !p.HasMore {
 		p.After = ""

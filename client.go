@@ -235,6 +235,9 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 			if err := json.Unmarshal(data, &env); err != nil {
 				return fmt.Errorf("paddle: decode response: %w", err)
 			}
+			if d := bytes.TrimSpace(env.Data); len(d) == 0 || string(d) == "null" {
+				return fmt.Errorf("%w: no data", ErrResponse)
+			}
 			target := out
 			if lr, ok := out.(*listResult); ok {
 				target = lr.items
@@ -303,14 +306,37 @@ func backoff(attempt int) time.Duration {
 	return d/2 + rand.N(d/2+1)
 }
 
-// retryAfter reads a Retry-After header in seconds; anything else falls back
-// to the default backoff.
+// retryAfter reads a Retry-After header, in seconds or as an HTTP date, and
+// caps it at maxRetryAfter; anything else, or a moment already past, falls
+// back to the default backoff. The cap is applied before the conversion to a
+// Duration, so a huge number cannot overflow into a negative wait.
 func retryAfter(v string) time.Duration {
-	s, err := strconv.Atoi(strings.TrimSpace(v))
-	if err != nil || s <= 0 {
-		return 0
+	v = strings.TrimSpace(v)
+	if s, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if s <= 0 {
+			return 0
+		}
+		return time.Duration(min(s, int64(maxRetryAfter/time.Second))) * time.Second
 	}
-	return min(time.Duration(s)*time.Second, maxRetryAfter)
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return min(d, maxRetryAfter)
+		}
+	}
+	return 0
+}
+
+// expectID checks the id of an entity a successful response carried: there
+// must be one, and when a call asked for a particular entity, it must be
+// that one. An empty or foreign entity is a protocol error, not a result.
+func expectID(what, got, want string) error {
+	if got == "" {
+		return fmt.Errorf("%w: %s without an id", ErrResponse, what)
+	}
+	if want != "" && got != want {
+		return fmt.Errorf("%w: asked for %s %q, got %q", ErrResponse, what, want, got)
+	}
+	return nil
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) error {
@@ -369,3 +395,10 @@ func checkID(what, id string) error {
 
 // ErrInvalid reports a request refused before it was sent.
 var ErrInvalid = errors.New("paddle: invalid request")
+
+// ErrResponse reports a successful response that does not hold what the call
+// expects: no data, an entity without an id or with another id than asked
+// for, a list that promises a next page without saying where it starts.
+// The response came from a broken proxy, a test double or an API change;
+// either way it is not a result to act on.
+var ErrResponse = errors.New("paddle: unexpected response")

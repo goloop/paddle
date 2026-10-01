@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-10-01
+
+### Fixed
+- A successful response with no data, an entity without an id, or another
+  entity than the one asked for is `ErrResponse` instead of an empty result.
+- A list page that promises more without a usable next page, starts where
+  the previous one did, or holds an item without an id is `ErrResponse`
+  instead of a quiet end of the list.
+- `Retry-After` is capped before it is converted, so a huge value no longer
+  overflows into no wait; an HTTP date is read too.
+- A negative quantity is refused before the request is sent.
+- `ExampleWebhook` handles `adjustment.created` as well as
+  `adjustment.updated`, and acts on approved refunds, chargebacks and their
+  reversals only.
+
+### Added
+- `ErrResponse`.
+- Notes on logging `APIError.Raw`, processing stored events, and keeping
+  sandbox and live apart.
+
 ## [0.2.0] - 2026-10-01
 
 ### Fixed

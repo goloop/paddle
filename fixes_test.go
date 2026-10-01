@@ -360,3 +360,68 @@ func TestDecodeError(t *testing.T) {
 		t.Fatalf("a decode error names the event type, got %v", err)
 	}
 }
+
+func TestEmptyOrForeignEntityIsAnError(t *testing.T) {
+	for name, data := range map[string]string{
+		"null data":    `{"data":null}`,
+		"no data":      `{"meta":{}}`,
+		"empty entity": `{"data":{}}`,
+		"other id":     `{"data":{"id":"txn_other"}}`,
+	} {
+		_, c := newServer(t, reply{status: 200, body: data})
+		if tx, err := c.GetTransaction(ctx, "txn_1"); !errors.Is(err, ErrResponse) || tx != nil {
+			t.Errorf("%s: a successful response without the transaction asked for is ErrResponse, got %+v, %v", name, tx, err)
+		}
+	}
+	_, c := newServer(t, ok(`{"status":"draft"}`))
+	if _, err := c.CreateTransaction(ctx, &CreateTransactionRequest{Items: []TransactionItemRequest{{PriceID: "pri_1"}}}); !errors.Is(err, ErrResponse) {
+		t.Fatalf("a created transaction without an id is ErrResponse, got %v", err)
+	}
+}
+
+func TestBrokenPaginationIsAnError(t *testing.T) {
+	for name, body := range map[string]string{
+		"has_more without next": `{"data":[{"id":"txn_1"}],"meta":{"pagination":{"has_more":true}}}`,
+		"has_more, bad next":    `{"data":[{"id":"txn_1"}],"meta":{"pagination":{"has_more":true,"next":"invalid"}}}`,
+		"same place again":      `{"data":[{"id":"txn_1"}],"meta":{"pagination":{"has_more":true,"next":"https://x/transactions?after=txn_0"}}}`,
+		"item without id":       `{"data":[{"status":"completed"}],"meta":{"pagination":{"has_more":false}}}`,
+	} {
+		_, c := newServer(t, reply{status: 200, body: body})
+		if _, err := c.ListTransactions(ctx, &ListTransactionsRequest{After: "txn_0"}); !errors.Is(err, ErrResponse) {
+			t.Errorf("%s: want ErrResponse, got %v", name, err)
+		}
+	}
+}
+
+func TestRetryAfterIsBounded(t *testing.T) {
+	if d := retryAfter("9223372037"); d != maxRetryAfter {
+		t.Fatalf("a huge Retry-After must be capped, not overflow: got %v", d)
+	}
+	if d := retryAfter(time.Now().Add(20 * time.Second).UTC().Format(http.TimeFormat)); d < 18*time.Second || d > 20*time.Second {
+		t.Fatalf("an HTTP date is read, got %v", d)
+	}
+	if d := retryAfter(time.Now().Add(-time.Hour).UTC().Format(http.TimeFormat)); d != 0 {
+		t.Fatalf("a date in the past falls back to the backoff, got %v", d)
+	}
+
+	// A 429 with an absurd Retry-After, then a success: the client waits the
+	// capped time, not a negative one.
+	var waited []time.Duration
+	_, c := newServer(t,
+		reply{status: 429, body: `{}`, header: map[string]string{"Retry-After": "9223372037"}},
+		ok(`{"id":"txn_1"}`))
+	c.sleep = func(_ context.Context, d time.Duration) error { waited = append(waited, d); return nil }
+	if _, err := c.GetTransaction(ctx, "txn_1"); err != nil || len(waited) != 1 || waited[0] != maxRetryAfter {
+		t.Fatalf("got %v, waited %v", err, waited)
+	}
+}
+
+func TestNegativeQuantityIsRefused(t *testing.T) {
+	c := New("k", WithBaseURL("http://127.0.0.1:1"))
+	if _, err := c.CreateTransaction(ctx, &CreateTransactionRequest{Items: []TransactionItemRequest{{PriceID: "pri_1", Quantity: -2}}}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("got %v", err)
+	}
+	if _, err := c.ChangeSubscriptionItems(ctx, "sub_1", []SubscriptionItemRequest{{PriceID: "pri_1", Quantity: -1}}, ProratedImmediately); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("got %v", err)
+	}
+}

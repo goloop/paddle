@@ -401,7 +401,15 @@ Verification:
 
 Handling:
 
-- Deduplicate on `ev.ID`: Paddle delivers at least once.
+- Deduplicate on `ev.ID`: Paddle delivers at least once. The event id names
+  a delivery, not a payment: two events can be about one transaction, so the
+  money moves under the transaction's or the refund record's key.
+- Verify the signature, and its age, when the request arrives. An event
+  stored after verification and processed later by a worker is decoded from
+  the stored body (`json.Unmarshal` into `paddle.Event`), not run through
+  `Parse` again: its five seconds are long gone.
+- Keep sandbox and live apart: a separate destination and secret per
+  environment, and an environment in every ledger key.
 - Answer 2xx within five seconds; a slow answer counts as a failure and the
   delivery comes again. When processing can take longer, store the event,
   answer, and process it from a queue.
@@ -452,7 +460,12 @@ for {
 `Status: approved`). Because every ledger movement is keyed by the provider's
 id, a transaction the webhook already applied is a no-op here.
 
-`ListTransactions` pages up to 30 items, `ListAdjustments` up to 50.
+`ListTransactions` pages up to 30 items, `ListAdjustments` up to 50. A page
+that cannot be trusted is `ErrResponse`, not the end of the list: an item
+without an id, `has_more` with no usable next page, or a next page that
+starts where the previous one did. Save the job's checkpoint only after a
+walk that reached the last page, and walk adjustments (refunds,
+chargebacks) as well as payments.
 
 ## Retries
 
@@ -470,7 +483,9 @@ a second transaction or a second refund. The error is returned and the
 caller decides - usually by reading the state back (`GetTransaction`) before
 trying again.
 
-`Retry-After` is capped at 60 seconds; the backoff is 0.5s, 1s, 2s ... with
+`Retry-After`, in seconds or as an HTTP date, is capped at 60 seconds - the
+cap is applied before the conversion, so a huge value cannot overflow into
+no wait at all; the backoff is 0.5s, 1s, 2s ... with
 jitter, at most 8s. A cancelled context stops the wait. A request that cannot
 be built - a malformed base URL - fails at once, without retries.
 
@@ -490,7 +505,16 @@ if errors.Is(err, paddle.ErrNotFound) { ... } // any 404
 ```
 
 `ErrInvalid` reports a request refused before it was sent: a missing field,
-an id outside the allowlist, an empty key, a base URL over plain HTTP.
+an id outside the allowlist, a negative quantity, an empty key, a base URL
+over plain HTTP.
+
+`ErrResponse` reports a successful answer that does not hold what the call
+expects: no data, an entity without an id or with another id than asked
+for, a list page that cannot be trusted. It comes from a broken proxy, a
+test double or a change in the API, and is never a result to act on.
+
+`APIError.Raw` holds the response body as received. Log the status, the code
+and the request id, not `Raw`: a body can carry customer data.
 
 ## Amounts and times
 

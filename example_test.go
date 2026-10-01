@@ -39,19 +39,43 @@ func ExampleWebhook() {
 			http.Error(w, "bad signature", http.StatusBadRequest)
 			return
 		}
-		switch ev.Type {
-		case paddle.EventTransactionCompleted:
-			tx, err := ev.Transaction()
-			if err != nil {
-				http.Error(w, "bad event", http.StatusBadRequest)
-				return
-			}
-			_ = tx.CustomData["purchase"] // find the purchase and credit it, once per ev.ID
-		case paddle.EventAdjustmentUpdated:
-			// a refund or a chargeback was decided
+		if err := apply(ev); err != nil {
+			http.Error(w, "retry", http.StatusInternalServerError) // Paddle sends it again
+			return
 		}
 		w.WriteHeader(http.StatusOK)
 	})
+}
+
+// apply acts on an event. Every effect is keyed by the provider's id, so an
+// event applied twice changes nothing.
+func apply(ev *paddle.Event) error {
+	switch ev.Type {
+	case paddle.EventTransactionCompleted:
+		tx, err := ev.Transaction()
+		if err != nil {
+			return err
+		}
+		_ = tx // check the amount and currency against the purchase, then credit it, keyed by tx.ID
+
+	// A refund approved later sends adjustment.updated; a chargeback, and a
+	// refund approved at once, send only adjustment.created.
+	case paddle.EventAdjustmentCreated, paddle.EventAdjustmentUpdated:
+		adj, err := ev.Adjustment()
+		if err != nil {
+			return err
+		}
+		if adj.Status != paddle.AdjustmentApproved {
+			return nil // pending or rejected: nothing moved yet
+		}
+		switch adj.Action {
+		case paddle.ActionRefund, paddle.ActionChargeback:
+			// take back what the money bought, under the refund record's key
+		case paddle.ActionChargebackReverse:
+			// the dispute was won: give back what the chargeback took
+		}
+	}
+	return nil
 }
 
 func ExampleSign() {
