@@ -1,12 +1,38 @@
 package paddle
 
-import "time"
+import (
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+)
 
 // Money is an amount in the lowest denomination of its currency ("1000" is
 // $10.00 in USD), as a string, exactly as the API sends it.
 type Money struct {
 	Amount       string `json:"amount"`
 	CurrencyCode string `json:"currency_code"`
+}
+
+// Int64 returns the amount as an integer in the lowest denomination. See
+// ParseAmount.
+func (m Money) Int64() (int64, error) { return ParseAmount(m.Amount) }
+
+// ParseAmount reads an amount as Paddle sends it - a string of digits in the
+// lowest denomination of the currency, such as a Totals field - into an
+// integer. It accepts nothing else: no decimal point, no exponent, no
+// spaces, so an amount is never rounded through a float on its way to a
+// balance.
+func ParseAmount(s string) (int64, error) {
+	digits := strings.TrimPrefix(s, "-")
+	if digits == "" || strings.TrimLeft(digits, "0123456789") != "" {
+		return 0, fmt.Errorf("paddle: amount %q is not an integer", s)
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("paddle: amount %q: %w", s, err)
+	}
+	return n, nil
 }
 
 // Duration is a billing cycle or a trial period: every Frequency Intervals.
@@ -90,9 +116,33 @@ type TransactionItem struct {
 	Quantity int   `json:"quantity"`
 }
 
-// TransactionDetails carries the calculated totals of a transaction.
+// TransactionDetails carries the calculated totals of a transaction and of
+// each of its lines.
 type TransactionDetails struct {
 	Totals Totals `json:"totals"`
+
+	// LineItems are the calculated lines. A partial refund names a line by
+	// its ID (AdjustmentItem.ItemID).
+	LineItems []TransactionLineItem `json:"line_items"`
+}
+
+// TransactionLineItem is one calculated line of a transaction.
+type TransactionLineItem struct {
+	// ID identifies the line ("txnitm_..."); it is what AdjustmentItem.ItemID
+	// names.
+	ID       string         `json:"id"`
+	PriceID  string         `json:"price_id"`
+	Quantity int            `json:"quantity"`
+	Totals   LineItemTotals `json:"totals"`
+}
+
+// LineItemTotals are the calculated amounts of one line, in the lowest
+// denomination of the transaction's currency.
+type LineItemTotals struct {
+	Subtotal string `json:"subtotal"`
+	Discount string `json:"discount"`
+	Tax      string `json:"tax"`
+	Total    string `json:"total"`
 }
 
 // Totals are the calculated amounts of a transaction, in the lowest
@@ -227,6 +277,12 @@ type AdjustmentTotal struct {
 	Earnings     string `json:"earnings"`
 	CurrencyCode string `json:"currency_code"`
 }
+
+// Customer statuses.
+const (
+	CustomerActive   = "active"
+	CustomerArchived = "archived"
+)
 
 // Customer is a Paddle customer.
 type Customer struct {

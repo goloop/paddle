@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -159,6 +160,17 @@ func NewWebhook(secret string, opts ...WebhookOption) *Webhook {
 	}
 	return w
 }
+
+// String describes the webhook without its secrets.
+func (w *Webhook) String() string {
+	return fmt.Sprintf("paddle.Webhook(%d secrets, tolerance %s)", len(w.secrets), w.tolerance)
+}
+
+// GoString is String, for %#v.
+func (w *Webhook) GoString() string { return w.String() }
+
+// LogValue implements slog.LogValuer, without the secrets.
+func (w *Webhook) LogValue() slog.Value { return slog.StringValue(w.String()) }
 
 // Verify checks a Paddle-Signature header against the raw body.
 //

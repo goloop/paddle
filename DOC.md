@@ -15,6 +15,7 @@ Ukrainian version: **[DOC.UK.md](DOC.UK.md)**.
 - [Customers and the portal](#customers-and-the-portal)
 - [Selling models](#selling-models)
 - [Webhooks](#webhooks)
+- [Reconciliation](#reconciliation)
 - [Retries](#retries)
 - [Errors](#errors)
 - [Amounts and times](#amounts-and-times)
@@ -53,9 +54,26 @@ where the client talks. Every request sends `Paddle-Version: 1`
 | Option | Default |
 |---|---|
 | `WithTimeout` | 30s (default HTTP client only) |
-| `WithHTTPClient` | a new `http.Client` |
-| `WithMaxRetries` | 2 |
+| `WithHTTPClient` | a new `http.Client`; nil keeps it |
+| `WithMaxRetries` | 2, at most `MaxRetries` (10) |
 | `WithHeader` | none |
+
+What the client refuses, whatever the options:
+
+- **Redirects.** The API has no reason to send one, and following it would
+  send the request - with its body, and for a custom header its key - to
+  another host. A 3xx comes back as an `*APIError`. A client passed to
+  `WithHTTPClient` is copied for this, never changed.
+- **Plain HTTP**, except to a loopback host (a test server): the key would
+  travel in the clear. An empty key is refused too. Both fail with
+  `ErrInvalid` before anything is sent.
+- **An id that could change the path.** Ids may hold letters, digits, `_`
+  and `-`, at most 128 bytes; anything else (`..`, an escaped slash, a
+  space) fails with `ErrInvalid`.
+
+The key never appears in output: `String`, `GoString` and `LogValue` show
+the host only, so a client in a log line or an error message does not leak
+it. A `Webhook` hides its secrets the same way.
 
 ## Transactions
 
@@ -97,6 +115,8 @@ event about the transaction, so a webhook can be matched even if saving the
 transaction id failed.
 
 `GetTransaction(ctx, id)` reads a transaction, for reconciliation.
+`Details.LineItems` holds its calculated lines; a partial refund names a line
+by its `ID`.
 
 ## Subscriptions
 
@@ -127,23 +147,39 @@ Paddle offers for updating the payment method and cancelling.
 adj, err := c.RefundTransaction(ctx, "txn_01...", "Withdrawal within 14 days")
 ```
 
-A refund needs a `completed` transaction and starts as
-`AdjustmentPendingApproval`; the `adjustment.updated` webhook reports
-`approved` or `rejected`. A partial refund lists the items:
+A refund needs a `completed` transaction. Most refunds start as
+`AdjustmentPendingApproval`, and `adjustment.updated` reports `approved` or
+`rejected` later; some are approved at once. A partial refund lists the lines
+it covers, by the ids in `Details.LineItems`:
 
 ```go
+tx, err := c.GetTransaction(ctx, "txn_01...")
 adj, err := c.CreateAdjustment(ctx, &paddle.CreateAdjustmentRequest{
 	Action:        paddle.ActionRefund,
-	TransactionID: "txn_01...",
+	TransactionID: tx.ID,
 	Reason:        "one of three items was not delivered",
 	Type:          "partial",
-	Items:         []paddle.AdjustmentItem{{ItemID: "txnitm_01...", Type: "full"}},
+	Items:         []paddle.AdjustmentItem{{ItemID: tx.Details.LineItems[2].ID, Type: "full"}},
 })
 ```
 
-Chargebacks arrive as adjustments too, created by Paddle: `ActionChargeback`,
-`ActionChargebackReverse`, `ActionChargebackWarning`. Treat an approved
-chargeback like a refund: take back what the money bought.
+Chargebacks arrive as adjustments too, created by Paddle: `ActionChargeback`
+(the money went back), `ActionChargebackWarning` (a dispute was opened),
+`ActionChargebackReverse` (the dispute was won, the money came back).
+
+**Which event carries what.** `adjustment.updated` fires only for a refund
+that waited for approval. A chargeback, and a refund approved at once, arrive
+only as `adjustment.created`, already `approved`. Listen to both, act when
+the status is `approved`, and key the ledger movement by the adjustment id -
+so the second event of the pair is a no-op:
+
+| Adjustment | Take back what the money bought | Give it back |
+|---|---|---|
+| `ActionRefund`, approved | yes | |
+| `ActionChargeback`, approved | yes | |
+| `ActionChargebackReverse`, approved | | yes, as much as the chargeback took |
+| `ActionChargebackWarning` | no: nothing moved yet | |
+| status `reversed` | | yes: the adjustment was undone |
 
 ## Customers and the portal
 
@@ -157,8 +193,17 @@ ps, err := c.CreatePortalSession(ctx, cu.ID, sub.ID)
 ```
 
 `CreateCustomer` fails with code `customer_already_exists` when the address
-belongs to a customer; `EnsureCustomer` handles that and two requests racing
-to create the same customer.
+belongs to a customer; `EnsureCustomer` handles that, two requests racing to
+create the same customer, and a customer that was archived (it is brought
+back to active). `CustomerByEmail` finds active and archived customers and
+compares the address in the answer, so it never returns someone else.
+
+**Call both only with an address the user has proved they own.** The
+customer they return opens portal sessions with the invoices, addresses and
+subscriptions of whoever registered the address at Paddle; an unverified
+sign-up with someone else's address would hand those over. For the same
+reason, pass to `CreatePortalSession` only a customer id your database ties
+to the signed-in account.
 
 Portal links are temporary: create a session when the customer asks and
 never store the links.
@@ -313,9 +358,10 @@ tx, err := c.CreateTransaction(ctx, &paddle.CreateTransactionRequest{
 adj, err := c.RefundTransaction(ctx, tx.ID, "Withdrawal within 14 days")
 ```
 
-Take back what the money bought only when `adjustment.updated` reports
-`approved`, keyed by the adjustment id. A chargeback arrives the same way,
-created by Paddle with `ActionChargeback`.
+Take back what the money bought when an adjustment is `approved`, keyed by
+the adjustment id, from `adjustment.created` and `adjustment.updated` both:
+a chargeback and a refund approved at once never send the second. See
+[Refunds and adjustments](#refunds-and-adjustments) for the table.
 
 ### Credits, allowances and usage
 
@@ -342,8 +388,12 @@ Verification:
   enough. `WithPreviousSecret` accepts an older secret on your side.
 - The timestamp must be within `DefaultTolerance` (5 seconds, the value
   Paddle documents) of the local clock, or the delivery fails with
-  `ErrSignatureExpired`. Keep the server clock synchronized; `WithTolerance`
-  widens the window.
+  `ErrSignatureExpired`. A clock more than 5 seconds off rejects **every**
+  delivery, payments included, until it is fixed. Keep the server clock
+  synchronized, count `ErrSignatureExpired` in your metrics, and where time
+  synchronization is not guaranteed use `WithTolerance(30*time.Second)`: a
+  replay is already stopped by the event ids you store and by the ledger's
+  keys, so the wider window costs little.
 - An empty secret verifies nothing, so a misconfigured service rejects every
   delivery instead of accepting forgeries.
 
@@ -353,7 +403,12 @@ Handling:
 
 - Deduplicate on `ev.ID`: Paddle delivers at least once.
 - Answer 2xx within five seconds; a slow answer counts as a failure and the
-  delivery comes again. Store the event, answer, then process.
+  delivery comes again. When processing can take longer, store the event,
+  answer, and process it from a queue.
+- Mark an event done only after it was applied. Marking it first loses it
+  when applying fails: the retry would find it done.
+- Paddle retries a failed delivery for three days, then gives up: see
+  [Reconciliation](#reconciliation).
 - Events can arrive out of order. Use `ev.OccurredAt` or the entity's own
   `UpdatedAt` to ignore an event older than the state already applied.
 
@@ -362,6 +417,42 @@ Decoding: `ev.Transaction()`, `ev.Subscription()`, `ev.Adjustment()`,
 name the common types; any other type still parses.
 
 `Sign(secret, body, at)` builds a valid header, for tests of your handler.
+
+## Reconciliation
+
+A webhook can be lost for good: a bug, an outage longer than Paddle's three
+days of retries, a secret rotated wrong. A payment whose webhook never
+arrived is a customer who paid and got nothing. A periodic job closes the gap:
+
+```go
+from := lastRun.Add(-time.Hour) // overlap: applying twice is a no-op
+req := &paddle.ListTransactionsRequest{
+	Status:      []string{paddle.TransactionCompleted},
+	UpdatedFrom: from,
+	OrderBy:     "updated_at[ASC]",
+}
+for {
+	page, err := c.ListTransactions(ctx, req)
+	if err != nil {
+		return err
+	}
+	for _, tx := range page.Items {
+		if err := purchases.Paid(ctx, &tx); err != nil { // the webhook's own code
+			return err
+		}
+	}
+	if !page.HasMore {
+		break
+	}
+	req.After = page.After
+}
+```
+
+`ListAdjustments` does the same for refunds and chargebacks (`Action`,
+`Status: approved`). Because every ledger movement is keyed by the provider's
+id, a transaction the webhook already applied is a no-op here.
+
+`ListTransactions` pages up to 30 items, `ListAdjustments` up to 50.
 
 ## Retries
 
@@ -380,7 +471,8 @@ caller decides - usually by reading the state back (`GetTransaction`) before
 trying again.
 
 `Retry-After` is capped at 60 seconds; the backoff is 0.5s, 1s, 2s ... with
-jitter. A cancelled context stops the wait.
+jitter, at most 8s. A cancelled context stops the wait. A request that cannot
+be built - a malformed base URL - fails at once, without retries.
 
 ## Errors
 
@@ -398,13 +490,15 @@ if errors.Is(err, paddle.ErrNotFound) { ... } // any 404
 ```
 
 `ErrInvalid` reports a request refused before it was sent: a missing field,
-an id that would change the URL path.
+an id outside the allowlist, an empty key, a base URL over plain HTTP.
 
 ## Amounts and times
 
 Amounts are strings in the lowest denomination of the currency, exactly as
-Paddle sends them: `"1000"` is $10.00. Convert with `strconv.ParseInt` where
-arithmetic is needed. Times are `time.Time`, optional ones `*time.Time`.
+Paddle sends them: `"1000"` is $10.00. Convert with `ParseAmount` (or
+`Money.Int64`), which accepts digits only - no decimal point, no exponent -
+so an amount never passes through a float on its way to a balance. Times are
+`time.Time`, optional ones `*time.Time`.
 
 ## Scope
 

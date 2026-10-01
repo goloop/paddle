@@ -36,6 +36,11 @@
 // least once, and a delivery that was not answered with a 2xx within five
 // seconds comes again.
 //
+// Money going back arrives as an adjustment, and not always with the same
+// event: a refund that waited for approval sends adjustment.updated, while a
+// chargeback and a refund approved at once send only adjustment.created.
+// Handle both, and act when the status is AdjustmentApproved.
+//
 //	wh := paddle.NewWebhook(os.Getenv("PADDLE_WEBHOOK_SECRET"))
 //	ev, err := wh.ParseRequest(r)
 //	switch ev.Type {
@@ -51,6 +56,18 @@
 // 5xx may have been applied, and the API takes no idempotency key, so
 // repeating it could create a second transaction or a second refund. That
 // decision is left to the caller, with the error in hand.
+//
+// # Reconciliation
+//
+// Paddle retries a failed delivery for three days. ListTransactions and
+// ListAdjustments let a periodic job find what never arrived and apply it
+// the way the webhook would.
+//
+// # Safety
+//
+// The client never follows a redirect, refuses plain HTTP except to a
+// loopback host, admits only letters, digits, "_" and "-" in an id that goes
+// into a path, and never prints its key: String and LogValue show the host.
 //
 // # Errors
 //

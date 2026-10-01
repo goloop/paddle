@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -318,9 +320,10 @@ type CreateAdjustmentRequest struct {
 	TaxMode string `json:"tax_mode,omitempty"`
 }
 
-// CreateAdjustment creates an adjustment. A refund starts as
-// AdjustmentPendingApproval; the adjustment.updated webhook reports the
-// decision.
+// CreateAdjustment creates an adjustment. Most refunds start as
+// AdjustmentPendingApproval, and adjustment.updated reports the decision;
+// some are approved at once and send only adjustment.created. A handler acts
+// on both events when the status is AdjustmentApproved.
 //
 // It is not retried on a 5xx: see the package documentation.
 func (c *Client) CreateAdjustment(ctx context.Context, req *CreateAdjustmentRequest) (*Adjustment, error) {
@@ -381,25 +384,36 @@ func (c *Client) GetCustomer(ctx context.Context, id string) (*Customer, error) 
 	return &out, nil
 }
 
-// CustomerByEmail returns the active customer with the address, or
-// ErrNotFound.
+// CustomerByEmail returns the customer with the address, active or archived,
+// or ErrNotFound. The address is compared in the answer as well as in the
+// query: a customer with another address is never returned.
+//
+// Call it only with an address the user has proved they own. The customer it
+// returns opens portal sessions, with the invoices, addresses and
+// subscriptions of whoever registered the address at Paddle.
 func (c *Client) CustomerByEmail(ctx context.Context, email string) (*Customer, error) {
 	if email == "" {
 		return nil, fmt.Errorf("%w: empty email", ErrInvalid)
 	}
+	q := url.Values{"email": {email}, "status": {CustomerActive + "," + CustomerArchived}}
 	var out []Customer
-	if err := c.do(ctx, http.MethodGet, "/customers?email="+url.QueryEscape(email), nil, &out); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/customers?"+q.Encode(), nil, &out); err != nil {
 		return nil, err
 	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("%w: no customer with email %q", ErrNotFound, email)
+	for i := range out {
+		if strings.EqualFold(out[i].Email, email) {
+			return &out[i], nil
+		}
 	}
-	return &out[0], nil
+	return nil, fmt.Errorf("%w: no customer with email %q", ErrNotFound, email)
 }
 
-// EnsureCustomer returns the customer with the address, creating it when
-// there is none. Two requests racing to create the same customer both end
-// with the one that won.
+// EnsureCustomer returns the active customer with the address, creating it
+// when there is none and bringing it back when it was archived. Two requests
+// racing to create the same customer both end with the one that won.
+//
+// Call it only with an address the user has proved they own: see
+// CustomerByEmail.
 func (c *Client) EnsureCustomer(ctx context.Context, email, name string) (*Customer, error) {
 	cu, err := c.CreateCustomer(ctx, &CreateCustomerRequest{Email: email, Name: name})
 	if err == nil {
@@ -409,7 +423,18 @@ func (c *Client) EnsureCustomer(ctx context.Context, email, name string) (*Custo
 	if !errors.As(err, &ae) || ae.Code != "customer_already_exists" {
 		return nil, err
 	}
-	return c.CustomerByEmail(ctx, email)
+	if cu, err = c.CustomerByEmail(ctx, email); err != nil {
+		return nil, err
+	}
+	if cu.Status != CustomerArchived {
+		return cu, nil
+	}
+	var out Customer
+	body := map[string]string{"status": CustomerActive}
+	if err := c.do(ctx, http.MethodPatch, "/customers/"+cu.ID, body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // CreatePortalSession creates temporary links into the customer portal,
@@ -427,4 +452,161 @@ func (c *Client) CreatePortalSession(ctx context.Context, customerID string, sub
 		return nil, err
 	}
 	return &out, nil
+}
+
+// Page is one page of a list. After marks where the next page starts: pass
+// it as the request's After. It is empty, and HasMore false, on the last
+// page.
+type Page[T any] struct {
+	Items   []T
+	After   string
+	HasMore bool
+}
+
+// ListTransactionsRequest filters ListTransactions. Every field is optional.
+type ListTransactionsRequest struct {
+	// Status keeps the transactions in any of the statuses, such as
+	// TransactionCompleted.
+	Status []string
+
+	// UpdatedFrom keeps the transactions updated at or after the time: the
+	// window a reconciliation job walks.
+	UpdatedFrom time.Time
+
+	CustomerID     string
+	SubscriptionID string
+
+	// OrderBy is "<field>[ASC]" or "<field>[DESC]" with field one of id,
+	// created_at, updated_at, billed_at; the API's default is id[DESC].
+	OrderBy string
+
+	// PerPage is at most 30, the API's limit and default.
+	PerPage int
+
+	// After is Page.After of the previous page.
+	After string
+}
+
+// ListTransactions returns a page of transactions.
+//
+// It is how a lost webhook is found: Paddle stops retrying a delivery after
+// three days, and a payment whose webhook never arrived would otherwise wait
+// for the customer to complain. A periodic job that lists completed
+// transactions updated since its last run, and applies each one the way the
+// webhook would, closes that gap; the ledger's keys make a transaction
+// applied twice a no-op.
+func (c *Client) ListTransactions(ctx context.Context, req *ListTransactionsRequest) (*Page[Transaction], error) {
+	if req == nil {
+		req = &ListTransactionsRequest{}
+	}
+	q := url.Values{}
+	if len(req.Status) > 0 {
+		q.Set("status", strings.Join(req.Status, ","))
+	}
+	if !req.UpdatedFrom.IsZero() {
+		q.Set("updated_at[GTE]", req.UpdatedFrom.UTC().Format(time.RFC3339))
+	}
+	for k, id := range map[string]string{"customer_id": req.CustomerID, "subscription_id": req.SubscriptionID, "after": req.After} {
+		if id == "" {
+			continue
+		}
+		if err := checkID(k, id); err != nil {
+			return nil, err
+		}
+		q.Set(k, id)
+	}
+	if req.OrderBy != "" {
+		q.Set("order_by", req.OrderBy)
+	}
+	if req.PerPage < 0 || req.PerPage > 30 {
+		return nil, fmt.Errorf("%w: per page %d is outside 1..30", ErrInvalid, req.PerPage)
+	}
+	if req.PerPage > 0 {
+		q.Set("per_page", strconv.Itoa(req.PerPage))
+	}
+	return list[Transaction](ctx, c, "/transactions", q)
+}
+
+// ListAdjustmentsRequest filters ListAdjustments. Every field is optional.
+type ListAdjustmentsRequest struct {
+	// Action keeps the adjustments with any of the actions, such as
+	// ActionRefund and ActionChargeback.
+	Action []string
+
+	// Status keeps the adjustments in any of the statuses, such as
+	// AdjustmentApproved.
+	Status []string
+
+	TransactionID  string
+	CustomerID     string
+	SubscriptionID string
+
+	// PerPage is at most 50; the API's default is 10.
+	PerPage int
+
+	// After is Page.After of the previous page.
+	After string
+}
+
+// ListAdjustments returns a page of adjustments, newest first: refunds and
+// chargebacks for a reconciliation job, as ListTransactions finds payments.
+func (c *Client) ListAdjustments(ctx context.Context, req *ListAdjustmentsRequest) (*Page[Adjustment], error) {
+	if req == nil {
+		req = &ListAdjustmentsRequest{}
+	}
+	q := url.Values{}
+	if len(req.Action) > 0 {
+		q.Set("action", strings.Join(req.Action, ","))
+	}
+	if len(req.Status) > 0 {
+		q.Set("status", strings.Join(req.Status, ","))
+	}
+	for k, id := range map[string]string{
+		"transaction_id": req.TransactionID, "customer_id": req.CustomerID,
+		"subscription_id": req.SubscriptionID, "after": req.After,
+	} {
+		if id == "" {
+			continue
+		}
+		if err := checkID(k, id); err != nil {
+			return nil, err
+		}
+		q.Set(k, id)
+	}
+	if req.PerPage < 0 || req.PerPage > 50 {
+		return nil, fmt.Errorf("%w: per page %d is outside 1..50", ErrInvalid, req.PerPage)
+	}
+	if req.PerPage > 0 {
+		q.Set("per_page", strconv.Itoa(req.PerPage))
+	}
+	return list[Adjustment](ctx, c, "/adjustments", q)
+}
+
+// list fetches one page of a list endpoint. Where the next page starts is
+// read from meta.pagination.next, a URL with an after parameter.
+func list[T any](ctx context.Context, c *Client, path string, q url.Values) (*Page[T], error) {
+	if len(q) > 0 {
+		path += "?" + q.Encode()
+	}
+	var items []T
+	lr := &listResult{items: &items}
+	if err := c.do(ctx, http.MethodGet, path, nil, lr); err != nil {
+		return nil, err
+	}
+	p := &Page[T]{Items: items}
+	if lr.page.Next != "" {
+		if u, err := url.Parse(lr.page.Next); err == nil {
+			p.After = u.Query().Get("after")
+		}
+	}
+	if lr.page.HasMore != nil {
+		p.HasMore = *lr.page.HasMore && p.After != ""
+	} else {
+		// Without has_more, a full page that names a next one may have it.
+		p.HasMore = p.After != "" && len(items) > 0 && len(items) >= max(lr.page.PerPage, 1)
+	}
+	if !p.HasMore {
+		p.After = ""
+	}
+	return p, nil
 }

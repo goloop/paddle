@@ -1,4 +1,4 @@
-[![Go Reference](https://img.shields.io/badge/godoc-reference-blue)](https://pkg.go.dev/github.com/goloop/paddle) [![License](https://img.shields.io/badge/license-MIT-brightgreen)](https://github.com/goloop/paddle/blob/master/LICENSE) [![Stay with Ukraine](https://img.shields.io/static/v1?label=Stay%20with&message=Ukraine%20♥&color=ffD700&labelColor=0057B8&style=flat)](https://u24.gov.ua/)
+[![deps.dev](https://img.shields.io/badge/deps.dev-insights-4c8dbc)](https://deps.dev/go/github.com%2Fgoloop%2Fpaddle) [![Go Reference](https://img.shields.io/badge/godoc-reference-blue)](https://pkg.go.dev/github.com/goloop/paddle) [![License](https://img.shields.io/badge/license-MIT-brightgreen)](https://github.com/goloop/paddle/blob/master/LICENSE) [![Stay with Ukraine](https://img.shields.io/static/v1?label=Stay%20with&message=Ukraine%20♥&color=ffD700&labelColor=0057B8&style=flat)](https://u24.gov.ua/)
 
 # paddle
 
@@ -26,8 +26,15 @@ happened. The server's part is small, but each piece has a trap:
   This client retries only what cannot have run.
 - **Sandbox keys must not reach production.** The host is chosen from the
   key itself.
+- **A chargeback is not an update.** A refund approved later arrives as
+  `adjustment.updated`; a chargeback, and a refund approved at once, arrive
+  only as `adjustment.created`. A handler that listens to one misses money
+  going back.
+- **A lost webhook is lost money.** Paddle stops retrying after three days;
+  `ListTransactions` and `ListAdjustments` let a periodic job find what never
+  arrived.
 
-The package does those four things right and keeps the rest a thin, typed
+The package does those things right and keeps the rest a thin, typed
 mapping of the API.
 
 ## Features
@@ -38,9 +45,12 @@ mapping of the API.
 - Subscriptions: get, cancel at the end of the period or at once, take back
   a scheduled change, pause, resume, change plan or seats with proration.
 - Refunds (full or partial) and chargebacks through adjustments.
-- Customers (`EnsureCustomer` survives a race) and customer portal sessions.
+- Customers (`EnsureCustomer` survives a race and brings back an archived
+  customer) and customer portal sessions.
 - Webhooks: signature check with rotation and a replay window, typed events.
-- Typed `*APIError`; retries that cannot double-charge.
+- Reconciliation: `ListTransactions` and `ListAdjustments`, paged.
+- Typed `*APIError`; retries that cannot double-charge; no redirects
+  followed, ids checked against an allowlist, keys never printed.
 - Zero dependencies.
 
 ## Installation
@@ -97,37 +107,67 @@ http.HandleFunc("POST /webhooks/paddle", func(w http.ResponseWriter, r *http.Req
 		http.Error(w, "bad signature", http.StatusBadRequest)
 		return
 	}
-	if seen, _ := events.Seen(r.Context(), ev.ID); seen { // your table
+	ctx := r.Context()
+	// The event table is a shortcut, not the guard: apply is idempotent on
+	// its own (keyed writes), and an event is marked done only after it was
+	// applied, so a failure here is retried by Paddle and never lost.
+	done, err := events.Done(ctx, ev.ID) // your table
+	if err != nil {
+		http.Error(w, "retry", http.StatusInternalServerError)
+		return
+	}
+	if done {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	switch ev.Type {
-	case paddle.EventTransactionCompleted:
-		tx, _ := ev.Transaction()
-		err = purchases.Paid(r.Context(), tx.CustomData["purchase"], tx.ID)
-	case paddle.EventSubscriptionUpdated, paddle.EventSubscriptionCanceled:
-		sub, _ := ev.Subscription()
-		err = entitlements.Sync(r.Context(), sub, ev.OccurredAt)
-	case paddle.EventAdjustmentUpdated:
-		adj, _ := ev.Adjustment()
-		err = purchases.Adjusted(r.Context(), adj)
+	if err := apply(ctx, ev); err != nil {
+		http.Error(w, "retry", http.StatusInternalServerError) // Paddle sends it again
+		return
 	}
-	if err != nil {
+	if err := events.MarkDone(ctx, ev.ID); err != nil {
 		http.Error(w, "retry", http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
 })
+
+func apply(ctx context.Context, ev *paddle.Event) error {
+	switch ev.Type {
+	case paddle.EventTransactionCompleted:
+		tx, err := ev.Transaction()
+		if err != nil {
+			return err
+		}
+		return purchases.Paid(ctx, tx) // check the amount and currency, then credit, keyed by tx.ID
+
+	case paddle.EventSubscriptionUpdated, paddle.EventSubscriptionCanceled:
+		sub, err := ev.Subscription()
+		if err != nil {
+			return err
+		}
+		return entitlements.Sync(ctx, sub, ev.OccurredAt) // ignores an event older than the state
+
+	// A refund approved later arrives as adjustment.updated; a chargeback,
+	// and a refund approved at once, only as adjustment.created.
+	case paddle.EventAdjustmentCreated, paddle.EventAdjustmentUpdated:
+		adj, err := ev.Adjustment()
+		if err != nil {
+			return err
+		}
+		return purchases.Adjusted(ctx, adj) // acts on approved, keyed by adj.ID
+	}
+	return nil
+}
 ```
 
 ## The API at a glance
 
 | Call | Endpoint |
 |---|---|
-| `CreateTransaction`, `GetTransaction` | `/transactions` |
+| `CreateTransaction`, `GetTransaction`, `ListTransactions` | `/transactions` |
 | `GetSubscription`, `CancelSubscription`, `PauseSubscription`, `ResumeSubscription` | `/subscriptions/{id}[/cancel,/pause,/resume]` |
 | `ChangeSubscriptionItems`, `RemoveScheduledChange` | `PATCH /subscriptions/{id}` |
-| `CreateAdjustment`, `RefundTransaction` | `/adjustments` |
+| `CreateAdjustment`, `RefundTransaction`, `ListAdjustments` | `/adjustments` |
 | `CreateCustomer`, `GetCustomer`, `CustomerByEmail`, `EnsureCustomer` | `/customers` |
 | `CreatePortalSession` | `/customers/{id}/portal-sessions` |
 | `NewWebhook`, `Webhook.ParseRequest`, `Sign` | notifications |

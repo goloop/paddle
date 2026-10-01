@@ -313,8 +313,8 @@ func TestEnsureCustomer(t *testing.T) {
 		if err != nil || cu.ID != "ctm_7" {
 			t.Fatalf("got %+v, %v", cu, err)
 		}
-		if s.got[1].Path != "/customers" || s.got[1].Query != "email=a%2Bx%40example.com" {
-			t.Fatalf("the email must be escaped in the query, got %q", s.got[1].Query)
+		if s.got[1].Path != "/customers" || s.got[1].Query != "email=a%2Bx%40example.com&status=active%2Carchived" {
+			t.Fatalf("the email must be escaped, and archived customers looked up too; got %q", s.got[1].Query)
 		}
 		if _, has := s.got[0].Body["name"]; has {
 			t.Fatal("an empty name must not be sent")
@@ -363,8 +363,8 @@ func TestExtraHeaderAndVersion(t *testing.T) {
 func TestWithTimeoutLeavesCustomClientAlone(t *testing.T) {
 	custom := &http.Client{Timeout: time.Minute}
 	c := New("k", WithHTTPClient(custom), WithTimeout(time.Second))
-	if c.http != custom || custom.Timeout != time.Minute {
-		t.Fatal("WithTimeout must not change a client the caller owns")
+	if c.http.Timeout != time.Minute || custom.Timeout != time.Minute || custom.CheckRedirect != nil {
+		t.Fatal("WithTimeout must not change a client the caller owns, and New must not mutate it")
 	}
 	if New("k", WithTimeout(time.Second)).http.Timeout != time.Second {
 		t.Fatal("WithTimeout must set the default client's timeout")
