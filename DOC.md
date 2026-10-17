@@ -531,3 +531,7 @@ reports, discounts or address APIs. The shared `do` path takes any endpoint,
 so a missing call is a small addition, not a new client.
 
 The package depends only on the standard library.
+
+## Release v1.0.0
+
+Publish the existing payment and webhook API as version 1.0.0. The v1 release keeps the existing import path and public API. Future incompatible changes require a new major version.
